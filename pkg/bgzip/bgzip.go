@@ -67,6 +67,9 @@ func NewReader(r io.Reader) (*Reader, error) {
 
 // Read reads decompressed data from the BGZF stream
 func (bg *Reader) Read(p []byte) (int, error) {
+	if bg.eof {
+		return 0, io.EOF
+	}
 	if bg.err != nil {
 		return 0, bg.err
 	}
@@ -111,7 +114,7 @@ func (bg *Reader) readBlock() (*Block, error) {
 	stdHeader := make([]byte, 10)
 	n, err := io.ReadFull(bg.r, stdHeader)
 	if err != nil {
-		if err == io.EOF {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			return nil, io.EOF
 		}
 		return nil, fmt.Errorf("failed to read standard header: %w", err)
