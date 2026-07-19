@@ -5,6 +5,7 @@ import (
 )
 
 func TestSAMFlagConstants(t *testing.T) {
+	// Verify SAM flag constants are distinct powers of two
 	flags := map[string]uint16{
 		"FlagPaired":      FlagPaired,
 		"FlagProperPair":   FlagProperPair,
@@ -30,16 +31,19 @@ func TestSAMFlagConstants(t *testing.T) {
 func TestRecord_IsPaired(t *testing.T) {
 	var rec Record
 
+	// Unmapped record should not be paired
 	rec.Flags = FlagUnmapped
 	if rec.IsPaired() {
 		t.Error("unmapped record should not be paired")
 	}
 
+	// Paired record should be paired
 	rec.Flags = FlagPaired
 	if !rec.IsPaired() {
 		t.Error("paired record should be paired")
 	}
 
+	// Paired + proper pair
 	rec.Flags = FlagPaired | FlagProperPair
 	if !rec.IsPaired() {
 		t.Error("properly paired record should be paired")
@@ -74,6 +78,26 @@ func TestRecord_IsMateUnmapped(t *testing.T) {
 	}
 }
 
+func TestRecord_HasRefID(t *testing.T) {
+	var rec Record
+	rec.RefID = 0
+	if !rec.HasRefID() {
+		t.Error("record with RefID=0 should have RefID (chr=*)")
+	}
+	rec.RefID = -1
+	if rec.HasRefID() {
+		t.Error("record with RefID=-1 should not have RefID")
+	}
+}
+
+func TestRecord_HasNM(t *testing.T) {
+	var rec Record
+	ok := HasNM(&rec, "NM")
+	if ok {
+		t.Log("NM tag unexpectedly present on empty record")
+	}
+}
+
 func TestRecord_GetAuxField(t *testing.T) {
 	var rec Record
 	aux := rec.GetAuxField("NM")
@@ -82,9 +106,21 @@ func TestRecord_GetAuxField(t *testing.T) {
 	}
 }
 
-func TestAuxField_Type(t *testing.T) {
-	var af AuxField
-	if af.Tag != "" {
-		t.Log("empty AuxField should have empty tag")
+func TestCIGARConstants(t *testing.T) {
+	ops := map[string]byte{
+		"CIGARMatch":              CIGARMatch,
+		"CIGARInsertion":          CIGARInsertion,
+		"CIGARDeletion":           CIGARDeletion,
+		"CIGARSkip":               CIGARSkip,
+		"CIGARSoftClip":           CIGARSoftClip,
+		"CIGARHardClip":           CIGARHardClip,
+		"CIGARPadding":            CIGARPadding,
+		"CIGARSequenceMatch":      CIGARSequenceMatch,
+		"CIGARSequenceMismatch":   CIGARSequenceMismatch,
+	}
+	for name, val := range ops {
+		if val == 0 {
+			t.Errorf("%s constant is zero", name)
+		}
 	}
 }
