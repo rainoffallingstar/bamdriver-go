@@ -7,7 +7,7 @@ import (
 func TestSAMFlagConstants(t *testing.T) {
 	// Verify SAM flag constants are distinct powers of two
 	flags := map[string]uint16{
-		"FlagPaired":      FlagPaired,
+		"FlagPaired":       FlagPaired,
 		"FlagProperPair":   FlagProperPair,
 		"FlagUnmapped":     FlagUnmapped,
 		"FlagMateUnmapped": FlagMateUnmapped,
@@ -108,15 +108,15 @@ func TestRecord_GetAuxField(t *testing.T) {
 
 func TestCIGARConstants(t *testing.T) {
 	ops := map[string]byte{
-		"CIGARMatch":              CIGARMatch,
-		"CIGARInsertion":          CIGARInsertion,
-		"CIGARDeletion":           CIGARDeletion,
-		"CIGARSkip":               CIGARSkip,
-		"CIGARSoftClip":           CIGARSoftClip,
-		"CIGARHardClip":           CIGARHardClip,
-		"CIGARPadding":            CIGARPadding,
-		"CIGARSequenceMatch":      CIGARSequenceMatch,
-		"CIGARSequenceMismatch":   CIGARSequenceMismatch,
+		"CigarMatch":     CigarMatch,
+		"CigarInsertion": CigarInsertion,
+		"CigarDeletion":  CigarDeletion,
+		"CigarSkip":      CigarSkip,
+		"CigarSoftClip":  CigarSoftClip,
+		"CigarHardClip":  CigarHardClip,
+		"CigarPadding":   CigarPadding,
+		"CigarEqual":     CigarEqual,
+		"CigarMismatch":  CigarMismatch,
 	}
 	for name, val := range ops {
 		if val == 0 {

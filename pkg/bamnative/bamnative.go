@@ -582,6 +582,12 @@ func (r *Record) IsUnmapped() bool {
 	return r.Flags&FlagUnmapped != 0
 }
 
+// HasRefID returns true if the record has a valid reference ID.
+// RefID == -1 indicates the record is unmapped or has no reference.
+func (r *Record) HasRefID() bool {
+	return r.RefID >= 0
+}
+
 // IsMateUnmapped returns true if the mate is unmapped
 func (r *Record) IsMateUnmapped() bool {
 	return r.Flags&FlagMateUnmapped != 0
