@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strconv"
 	"strings"
 
 	"github.com/rainoffallingstar/bamdriver-go/pkg/bgzip"
@@ -23,14 +24,22 @@ var (
 	ErrReferenceNotFound = errors.New("reference not found")
 )
 
+const (
+	maximumHeaderTextSize    = 64 << 20
+	maximumRecordSize        = 256 << 20
+	maximumReferenceNameSize = 1 << 20
+	maximumReferenceCount    = 1 << 20
+)
+
 // Header represents the BAM file header
 type Header struct {
-	Version    string            // Version string (e.g., "1.0" or empty)
-	SortOrder  string            // Sort order (e.g., "coordinate", "queryname", "unknown")
-	OtherLines map[string]string // Other header lines (non-@RG/@PG lines)
-	References []*Reference      // Reference sequences
-	RGLines    []string          // @RG lines (read group), preserved from input
-	PGLines    []string          // @PG lines (program), preserved from input
+	Version          string            // Version string (e.g., "1.6" or empty)
+	SortOrder        string            // Sort order (e.g., "coordinate", "queryname", "unknown")
+	OtherLines       map[string]string // Legacy lookup for non-@RG/@PG lines
+	OtherHeaderLines []string          // Ordered non-@HD/@SQ lines, including duplicates
+	References       []*Reference      // Reference sequences
+	RGLines          []string          // @RG lines (read group), preserved from input
+	PGLines          []string          // @PG lines (program), preserved from input
 }
 
 // Reference represents a reference sequence (chromosome)
@@ -177,21 +186,19 @@ func readHeader(r *bgzip.Reader) (*Header, error) {
 		return nil, fmt.Errorf("failed to read header text length: %w", err)
 	}
 
-	headerTextLen := int32(binary.LittleEndian.Uint32(lenBuf))
-	if headerTextLen <= 0 {
+	headerTextLength := int64(int32(binary.LittleEndian.Uint32(lenBuf)))
+	if headerTextLength < 0 || headerTextLength > maximumHeaderTextSize {
 		return nil, ErrInvalidHeader
 	}
 
-	// Read header text
-	headerTextBytes := make([]byte, headerTextLen)
+	headerTextBytes := make([]byte, int(headerTextLength))
 	_, err = r.ReadFull(headerTextBytes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read header text: %w", err)
 	}
 
-	// Verify we read the correct amount
-	if len(headerTextBytes) != int(headerTextLen) {
-		return nil, fmt.Errorf("header text length mismatch: expected %d, got %d", headerTextLen, len(headerTextBytes))
+	if len(headerTextBytes) != int(headerTextLength) {
+		return nil, fmt.Errorf("header text length mismatch: expected %d, got %d", headerTextLength, len(headerTextBytes))
 	}
 
 	headerText := string(headerTextBytes)
@@ -200,6 +207,7 @@ func readHeader(r *bgzip.Reader) (*Header, error) {
 	header := &Header{
 		OtherLines: make(map[string]string),
 	}
+	var textReferences []*Reference
 
 	lines := strings.Split(headerText, "\n")
 	for _, line := range lines {
@@ -222,25 +230,31 @@ func readHeader(r *bgzip.Reader) (*Header, error) {
 				}
 			}
 		case "@SQ":
-			// Reference sequence
-			ref := &Reference{}
+			textReference := &Reference{ID: int32(len(textReferences)), Len: -1}
 			for _, field := range fields[1:] {
 				if strings.HasPrefix(field, "SN:") {
-					ref.Name = strings.TrimPrefix(field, "SN:")
+					textReference.Name = strings.TrimPrefix(field, "SN:")
 				} else if strings.HasPrefix(field, "LN:") {
-					fmt.Sscanf(strings.TrimPrefix(field, "LN:"), "%d", &ref.Len)
+					parsedLength, parseErr := strconv.ParseInt(strings.TrimPrefix(field, "LN:"), 10, 32)
+					if parseErr != nil || parsedLength < 0 {
+						return nil, ErrInvalidHeader
+					}
+					textReference.Len = int32(parsedLength)
 				}
 			}
-			if ref.Name != "" {
-				ref.ID = int32(len(header.References))
-				header.References = append(header.References, ref)
+			if textReference.Name == "" || textReference.Len < 0 {
+				return nil, ErrInvalidHeader
 			}
+			textReferences = append(textReferences, textReference)
 		case "@RG":
 			header.RGLines = append(header.RGLines, line)
+			header.OtherHeaderLines = append(header.OtherHeaderLines, line)
 		case "@PG":
 			header.PGLines = append(header.PGLines, line)
+			header.OtherHeaderLines = append(header.OtherHeaderLines, line)
 		default:
 			header.OtherLines[tag] = line
+			header.OtherHeaderLines = append(header.OtherHeaderLines, line)
 		}
 	}
 
@@ -251,37 +265,62 @@ func readHeader(r *bgzip.Reader) (*Header, error) {
 		return nil, fmt.Errorf("failed to read reference count: %w", err)
 	}
 
-	nRef := int32(binary.LittleEndian.Uint32(nRefBuf))
-
-	// Validate reference count matches parsed @SQ lines
-	if nRef != int32(len(header.References)) {
+	referenceCount := int64(int32(binary.LittleEndian.Uint32(nRefBuf)))
+	if referenceCount < 0 || referenceCount > maximumReferenceCount {
+		return nil, ErrInvalidHeader
+	}
+	if len(textReferences) > 0 && int64(len(textReferences)) != referenceCount {
 		return nil, ErrInvalidHeader
 	}
 
-	// Read binary reference data (name_len + name + length for each reference)
-	// We need to skip this even though we already parsed from text
-	for i := int32(0); i < nRef; i++ {
+	header.References = make([]*Reference, 0, int(referenceCount))
+	for referenceIndex := int64(0); referenceIndex < referenceCount; referenceIndex++ {
 		// Read name length
 		nameLenBuf := make([]byte, 4)
 		_, err := r.ReadFull(nameLenBuf)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read ref name length: %w", err)
 		}
-		nameLen := int32(binary.LittleEndian.Uint32(nameLenBuf))
+		nameLength := int64(int32(binary.LittleEndian.Uint32(nameLenBuf)))
+		if nameLength < 1 || nameLength > maximumReferenceNameSize {
+			return nil, ErrInvalidHeader
+		}
 
-		// Read name
-		nameBuf := make([]byte, nameLen)
+		nameBuf := make([]byte, int(nameLength))
 		_, err = r.ReadFull(nameBuf)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read ref name: %w", err)
 		}
+		if nameBuf[len(nameBuf)-1] != 0 {
+			return nil, ErrInvalidHeader
+		}
 
-		// Read reference length
+		referenceName := string(nameBuf[:len(nameBuf)-1])
+		if referenceName == "" {
+			return nil, ErrInvalidHeader
+		}
+
 		lenBuf := make([]byte, 4)
 		_, err = r.ReadFull(lenBuf)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read ref length: %w", err)
 		}
+		referenceLength := int32(binary.LittleEndian.Uint32(lenBuf))
+		if referenceLength < 0 {
+			return nil, ErrInvalidHeader
+		}
+		binaryReference := &Reference{
+			ID:   int32(referenceIndex),
+			Name: referenceName,
+			Len:  referenceLength,
+		}
+		if len(textReferences) > 0 {
+			textReference := textReferences[referenceIndex]
+			if textReference.Name != binaryReference.Name || textReference.Len != binaryReference.Len {
+				return nil, ErrInvalidHeader
+			}
+		}
+		header.References = append(header.References, binaryReference)
 	}
 
 	return header, nil
@@ -299,14 +338,12 @@ func readRecord(r *bgzip.Reader, header *Header) (*Record, error) {
 		return nil, fmt.Errorf("failed to read block size: %w", err)
 	}
 
-	blockSize := int32(binary.LittleEndian.Uint32(blockSizeBuf))
-
-	if blockSize <= 0 {
+	blockSize := int64(int32(binary.LittleEndian.Uint32(blockSizeBuf)))
+	if blockSize < 32 || blockSize > maximumRecordSize {
 		return nil, ErrInvalidRecord
 	}
 
-	// Read the rest of the record
-	recordData := make([]byte, blockSize)
+	recordData := make([]byte, int(blockSize))
 	_, err = r.ReadFull(recordData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read record data: %w", err)
@@ -383,11 +420,11 @@ func readRecord(r *bgzip.Reader, header *Header) (*Record, error) {
 	record.TLen = int32(binary.LittleEndian.Uint32(buf[0:4]))
 	buf = buf[4:]
 
-	// Read Read Name (l_qname bytes, including null terminator)
-	if len(buf) < l_qname {
+	// Read Read Name (l_qname bytes, including null terminator).
+	if l_qname < 1 || len(buf) < l_qname || buf[l_qname-1] != 0 {
 		return nil, ErrInvalidRecord
 	}
-	record.Name = string(buf[0 : l_qname-1]) // Exclude null terminator
+	record.Name = string(buf[:l_qname-1])
 	buf = buf[l_qname:]
 
 	// Read CIGAR operations
@@ -399,12 +436,14 @@ func readRecord(r *bgzip.Reader, header *Header) (*Record, error) {
 		cigarInt := binary.LittleEndian.Uint32(buf[0:4])
 		buf = buf[4:]
 
-		opLen := cigarInt >> 4
+		opLength := cigarInt >> 4
 		opType := byte(cigarInt & 0xf)
+		if opLength == 0 || opType > 8 {
+			return nil, ErrInvalidCigar
+		}
 
-		// Convert numeric op type to character
 		opChar := cigarNumToChar(opType)
-		record.Cigar[i] = CigarOp{Op: opChar, Len: int(opLen)}
+		record.Cigar[i] = CigarOp{Op: opChar, Len: int(opLength)}
 	}
 
 	// Read Sequence
@@ -443,11 +482,10 @@ func readRecord(r *bgzip.Reader, header *Header) (*Record, error) {
 	copy(record.Qual, buf[0:lSeq])
 	buf = buf[lSeq:]
 
-	// Read Auxiliary Fields
 	record.Aux = []*AuxField{}
 	for len(buf) > 0 {
 		if len(buf) < 3 {
-			break
+			return nil, ErrInvalidAux
 		}
 
 		// Read Tag (2 bytes)
@@ -662,21 +700,10 @@ func cigarNumToChar(n byte) byte {
 	}
 }
 
-func seqBaseToChar(b byte) byte {
-	switch b {
-	case 0:
-		return '='
-	case 1:
-		return 'A'
-	case 2:
-		return 'C'
-	case 4:
-		return 'G'
-	case 8:
-		return 'T'
-	case 15:
+func seqBaseToChar(baseCode byte) byte {
+	const sequenceAlphabet = "=ACMGRSVTWYHKDBN"
+	if int(baseCode) >= len(sequenceAlphabet) {
 		return 'N'
-	default:
-		return 'N' // other IUPAC ambiguity codes
 	}
+	return sequenceAlphabet[baseCode]
 }

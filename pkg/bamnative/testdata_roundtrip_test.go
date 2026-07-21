@@ -148,6 +148,72 @@ func TestWriterOutputIsSamtoolsCompatible(t *testing.T) {
 	runSamtools(t, "view", "-c", outPath)
 }
 
+func TestGeneratedIndexesAreSamtoolsCompatible(t *testing.T) {
+	if _, err := exec.LookPath("samtools"); err != nil {
+		t.Skip("samtools not available")
+	}
+
+	temporaryDirectory := t.TempDir()
+	bamPath := filepath.Join(temporaryDirectory, "indexed.bam")
+	header := &Header{
+		Version:   "1.6",
+		SortOrder: "coordinate",
+		References: []*Reference{
+			{ID: 0, Name: "chr1", Len: 1000},
+		},
+	}
+	writer, err := NewWriter(bamPath, header)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	for recordIndex, position := range []int32{9, 99, 199} {
+		record := &Record{
+			Name:      fmt.Sprintf("read-%d", recordIndex),
+			RefID:     0,
+			Pos:       position,
+			MapQ:      60,
+			MateRefID: -1,
+			MatePos:   -1,
+			Cigar:     []CigarOp{{Op: CigarMatch, Len: 5}},
+			Seq:       "ACGTN",
+		}
+		if err := writer.Write(record); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := BuildIndex(bamPath); err != nil {
+		t.Fatalf("BuildIndex: %v", err)
+	}
+
+	regionCommand := exec.Command("samtools", "view", bamPath, "chr1:90-120")
+	regionOutput, err := regionCommand.Output()
+	if err != nil {
+		t.Fatalf("samtools region query: %v", err)
+	}
+	if !bytes.Contains(regionOutput, []byte("read-1")) {
+		t.Fatalf("region query output = %q, want read-1", regionOutput)
+	}
+
+	fastaPath := filepath.Join(temporaryDirectory, "reference.fa")
+	if err := os.WriteFile(fastaPath, []byte(">chr1\nACGT\nTGCA\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile FASTA: %v", err)
+	}
+	if _, err := NewFastaReader(fastaPath); err != nil {
+		t.Fatalf("NewFastaReader: %v", err)
+	}
+	faidxCommand := exec.Command("samtools", "faidx", fastaPath, "chr1:3-6")
+	faidxOutput, err := faidxCommand.Output()
+	if err != nil {
+		t.Fatalf("samtools faidx query: %v", err)
+	}
+	if !bytes.Contains(faidxOutput, []byte("GTTG")) {
+		t.Fatalf("faidx output = %q, want GTTG", faidxOutput)
+	}
+}
+
 func runSamtools(t *testing.T, args ...string) {
 	t.Helper()
 	cmd := exec.Command("samtools", args...)

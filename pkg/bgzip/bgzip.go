@@ -110,17 +110,19 @@ func (bg *Reader) readBlock() (*Block, error) {
 	// Save the compressed offset of this block's start before reading any bytes.
 	blockStart := bg.compressedOffset
 
-	// Read standard gzip header (10 bytes)
+	// Read standard gzip header (10 bytes). EOF is only clean when no bytes
+	// from a new block were consumed; a partial header means the stream was
+	// truncated and must not be accepted as a complete BAM file.
 	stdHeader := make([]byte, 10)
 	n, err := io.ReadFull(bg.r, stdHeader)
 	if err != nil {
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
+		if err == io.EOF && n == 0 {
 			return nil, io.EOF
 		}
+		if err == io.ErrUnexpectedEOF || n > 0 {
+			return nil, ErrTruncated
+		}
 		return nil, fmt.Errorf("failed to read standard header: %w", err)
-	}
-	if n < 10 {
-		return nil, ErrTruncated
 	}
 
 	// Validate gzip magic
@@ -156,32 +158,43 @@ func (bg *Reader) readBlock() (*Block, error) {
 		return nil, ErrTruncated
 	}
 
-	// Parse BGZF BC subfield from extra field
+	// Parse the extra field as a sequence of gzip subfields. A byte-wise scan
+	// can mistake payload bytes for a BC subfield and can read beyond malformed
+	// subfield boundaries.
 	foundBC := false
 	var bsize int
-	for i := 0; i <= xlen-6; i++ {
-		if extraField[i] == BGZF_SI1 && extraField[i+1] == BGZF_SI2 {
-			slen := int(extraField[i+2]) | int(extraField[i+3])<<8
-			if slen != BGZF_SLEN {
-				continue
-			}
-			bsize = int(extraField[i+4]) | int(extraField[i+5])<<8
-			foundBC = true
-			break
+	for offset := 0; offset < len(extraField); {
+		if len(extraField)-offset < 4 {
+			return nil, ErrExtraField
 		}
+		subfieldLength := int(extraField[offset+2]) | int(extraField[offset+3])<<8
+		subfieldEnd := offset + 4 + subfieldLength
+		if subfieldEnd > len(extraField) {
+			return nil, ErrExtraField
+		}
+		if extraField[offset] == BGZF_SI1 && extraField[offset+1] == BGZF_SI2 {
+			if subfieldLength != BGZF_SLEN {
+				return nil, ErrExtraField
+			}
+			bsize = int(extraField[offset+4]) | int(extraField[offset+5])<<8
+			foundBC = true
+		}
+		offset = subfieldEnd
 	}
 
 	if !foundBC {
 		return nil, ErrNoBGZF
 	}
 
-	// Calculate total BGZF block size
-	// BSIZE + 1 = total block size
+	// BSIZE stores the total compressed block size minus one. The fixed gzip
+	// trailer needs eight bytes, so reject blocks whose declared size cannot
+	// contain the header, extra fields, and trailer before allocating memory.
 	totalBlockSize := bsize + 1
+	minimumBlockSize := 12 + xlen + 8
+	if totalBlockSize < minimumBlockSize || totalBlockSize > BGZF_MAX_BLOCK_SIZE {
+		return nil, ErrBlockSize
+	}
 
-	// Read the entire rest of the BGZF block (compressed data + 8-byte trailer)
-	// We've already read: 10 (std header) + 2 (XLEN) + xlen (extra field) = 12 + xlen bytes
-	// Remaining: totalBlockSize - (12 + xlen)
 	remainingInBlock := totalBlockSize - (12 + xlen)
 	restOfBlock := make([]byte, remainingInBlock)
 	n, err = io.ReadFull(bg.r, restOfBlock)
@@ -210,10 +223,15 @@ func (bg *Reader) readBlock() (*Block, error) {
 	}
 	defer gzipReader.Close()
 
-	// Read decompressed data
-	decompressed, err := io.ReadAll(gzipReader)
+	// Decompress through a bounded reader. A BGZF block may contain at most
+	// 64 KiB of uncompressed data; reading one extra byte lets us reject a
+	// malformed or malicious gzip member without unbounded allocation.
+	decompressed, err := io.ReadAll(io.LimitReader(gzipReader, BGZF_MAX_BLOCK_SIZE+1))
 	if err != nil {
 		return nil, fmt.Errorf("decompression failed: %w", err)
+	}
+	if len(decompressed) > BGZF_MAX_BLOCK_SIZE {
+		return nil, ErrBlockSize
 	}
 
 	return &Block{

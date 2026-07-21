@@ -2,150 +2,121 @@ package bamnative
 
 import (
 	"bytes"
+	"fmt"
 )
 
-// CalculateNM calculates the NM (edit distance) tag by comparing read to reference
-// NM = mismatches + insertions + deletions
-func CalculateNM(record *Record, ref []byte, isBisulfite bool) int {
-	if len(record.Seq) == 0 || record.RefID < 0 {
+// CalculateNM calculates NM while preserving the historical no-error API.
+func CalculateNM(record *Record, reference []byte, isBisulfite bool) int {
+	nm, err := CalculateNMChecked(record, reference, isBisulfite)
+	if err != nil {
 		return 0
 	}
-
-	// record.Seq is already decoded ASCII by the BAM reader; use it directly
-	readSeq := []byte(record.Seq)
-
-	// Get reference position (0-based in BAM)
-	refPos := int(record.Pos)
-
-	// Parse CIGAR and calculate NM
-	nm := 0
-
-	// Position in read sequence
-	readIdx := 0
-	// Position in reference sequence
-	refIdx := refPos
-
-	for _, cigar := range record.Cigar {
-		switch cigar.Op {
-		case CigarMatch:
-			// M: match or mismatch - count as full length
-			// Need to compare each position to find actual mismatches
-			for i := 0; i < cigar.Len; i++ {
-				if refIdx+i >= len(ref) || readIdx+i >= len(readSeq) {
-					break
-				}
-				refBase := toUpper(ref[refIdx+i])
-				readBase := toUpper(readSeq[readIdx+i])
-
-				if isBisulfite {
-					// In bisulfite mode, C->T on read is not counted as mismatch
-					// if reference has C
-					if refBase == 'C' && readBase == 'T' {
-						// forward strand: C->T conversion, not a mismatch
-					} else if refBase == 'G' && readBase == 'A' {
-						// reverse strand: G->A conversion (complement of C->T), not a mismatch
-					} else if refBase != readBase {
-						nm++
-					}
-				} else {
-					if refBase != readBase {
-						nm++
-					}
-				}
-			}
-			readIdx += cigar.Len
-			refIdx += cigar.Len
-
-		case CigarEqual:
-			// =: exact match - no mismatches
-			readIdx += cigar.Len
-			refIdx += cigar.Len
-
-		case CigarMismatch:
-			// X: all are mismatches
-			nm += cigar.Len
-			readIdx += cigar.Len
-			refIdx += cigar.Len
-
-		case CigarInsertion:
-			// I: insertion relative to reference
-			nm += cigar.Len
-			readIdx += cigar.Len
-
-		case CigarDeletion:
-			// D: deletion relative to reference
-			nm += cigar.Len
-			refIdx += cigar.Len
-
-		case CigarSkip:
-			// N: intron skip - not counted in NM per SAM spec
-			refIdx += cigar.Len
-
-		case CigarSoftClip:
-			// S: soft clip - not counted in NM; tracked separately as clips
-			readIdx += cigar.Len
-
-		case CigarHardClip:
-			// H: hard clip - sequence not present in read
-			// Does not affect NM - no position changes
-
-		case CigarPadding:
-			// P: padding - no effect on NM
-		}
-	}
-
 	return nm
 }
 
-// decodeSeq converts BAM 4-bit encoded sequence to byte slice
-// BAM uses: 0=?, 1=A, 2=C, 3=G, 4=T, 5=N, 6=<, 7=>
-func decodeSeq(bamSeq string) []byte {
-	// BAM sequence is stored as a string where each character encodes 2 bases
-	// using 4-bit encoding: 0-15 per nibble
-	seqMap := map[byte]byte{
-		'0': '=', // or '?'
-		'1': 'A',
-		'2': 'C',
-		'3': 'G',
-		'4': 'T',
-		'5': 'N',
-		'6': '<',
-		'7': '>',
-		'8': '?',
-		'9': '?',
-		'a': 'A', // Could be lower case?
-		'b': 'C',
-		'c': 'G',
-		'd': 'T',
-		'e': 'N',
-		'f': '?',
+// CalculateNMChecked calculates NM and rejects malformed CIGAR or truncated input.
+func CalculateNMChecked(record *Record, reference []byte, isBisulfite bool) (int, error) {
+	if record == nil {
+		return 0, fmt.Errorf("record is nil")
+	}
+	if record.RefID < 0 || record.Flags&FlagUnmapped != 0 {
+		return 0, nil
+	}
+	if record.Pos < 0 {
+		return 0, fmt.Errorf("record has negative reference position %d", record.Pos)
 	}
 
-	result := make([]byte, 0, len(bamSeq)*2)
+	readSequence := []byte(record.Seq)
+	readIndex := 0
+	referenceIndex := int(record.Pos)
+	nm := 0
 
-	for i := 0; i < len(bamSeq); i++ {
-		// Each byte encodes two bases
-		hi := (bamSeq[i] >> 4) & 0x0F
-		lo := bamSeq[i] & 0x0F
-
-		if hi <= 9 {
-			if hi <= 5 {
-				result = append(result, seqMap[byte('0'+hi)])
-			} else {
-				result = append(result, seqMap[byte('a'+hi-10)])
-			}
+	ensureReadAvailable := func(length int, operation byte) error {
+		if length < 0 || readIndex > len(readSequence)-length {
+			return fmt.Errorf("CIGAR %d%c exceeds read length at offset %d", length, operation, readIndex)
 		}
+		return nil
+	}
+	ensureReferenceAvailable := func(length int, operation byte) error {
+		if length < 0 || referenceIndex > len(reference)-length {
+			return fmt.Errorf("CIGAR %d%c exceeds reference length at offset %d", length, operation, referenceIndex)
+		}
+		return nil
+	}
 
-		if lo <= 9 {
-			if lo <= 5 {
-				result = append(result, seqMap[byte('0'+lo)])
-			} else {
-				result = append(result, seqMap[byte('a'+lo-10)])
+	for operationIndex, operation := range record.Cigar {
+		if operation.Len <= 0 {
+			return 0, fmt.Errorf("CIGAR operation %d has invalid length %d", operationIndex, operation.Len)
+		}
+		switch operation.Op {
+		case CigarMatch:
+			if err := ensureReadAvailable(operation.Len, operation.Op); err != nil {
+				return 0, err
 			}
+			if err := ensureReferenceAvailable(operation.Len, operation.Op); err != nil {
+				return 0, err
+			}
+			for baseOffset := 0; baseOffset < operation.Len; baseOffset++ {
+				referenceBase := toUpper(reference[referenceIndex+baseOffset])
+				readBase := toUpper(readSequence[readIndex+baseOffset])
+				isBisulfiteConversion := isBisulfite && ((referenceBase == 'C' && readBase == 'T') || (referenceBase == 'G' && readBase == 'A'))
+				if referenceBase != readBase && !isBisulfiteConversion {
+					nm++
+				}
+			}
+			readIndex += operation.Len
+			referenceIndex += operation.Len
+		case CigarEqual:
+			if err := ensureReadAvailable(operation.Len, operation.Op); err != nil {
+				return 0, err
+			}
+			if err := ensureReferenceAvailable(operation.Len, operation.Op); err != nil {
+				return 0, err
+			}
+			readIndex += operation.Len
+			referenceIndex += operation.Len
+		case CigarMismatch:
+			if err := ensureReadAvailable(operation.Len, operation.Op); err != nil {
+				return 0, err
+			}
+			if err := ensureReferenceAvailable(operation.Len, operation.Op); err != nil {
+				return 0, err
+			}
+			nm += operation.Len
+			readIndex += operation.Len
+			referenceIndex += operation.Len
+		case CigarInsertion:
+			if err := ensureReadAvailable(operation.Len, operation.Op); err != nil {
+				return 0, err
+			}
+			nm += operation.Len
+			readIndex += operation.Len
+		case CigarDeletion:
+			if err := ensureReferenceAvailable(operation.Len, operation.Op); err != nil {
+				return 0, err
+			}
+			nm += operation.Len
+			referenceIndex += operation.Len
+		case CigarSkip:
+			if err := ensureReferenceAvailable(operation.Len, operation.Op); err != nil {
+				return 0, err
+			}
+			referenceIndex += operation.Len
+		case CigarSoftClip:
+			if err := ensureReadAvailable(operation.Len, operation.Op); err != nil {
+				return 0, err
+			}
+			readIndex += operation.Len
+		case CigarHardClip, CigarPadding:
+		default:
+			return 0, fmt.Errorf("unknown CIGAR operation %q", operation.Op)
 		}
 	}
 
-	return result
+	if readIndex != len(readSequence) {
+		return 0, fmt.Errorf("CIGAR consumes %d read bases, sequence has %d", readIndex, len(readSequence))
+	}
+	return nm, nil
 }
 
 // toUpper converts byte to uppercase

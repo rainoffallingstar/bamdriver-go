@@ -2,11 +2,15 @@ package bamnative
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 )
 
 // FastaIndex represents a FASTA file loaded into memory (backward compatibility)
@@ -90,85 +94,112 @@ type FastaIndexEntry struct {
 
 // FastaReader provides streaming FASTA access with optional indexing
 type FastaReader struct {
-	path      string
-	isGzipped bool
-	entries   map[string]*FastaIndexEntry
-	cache     map[string][]byte
-	cacheSize int
-	maxCache  int // Maximum number of sequences to keep in cache
+	path       string
+	isGzipped  bool
+	entries    map[string]*FastaIndexEntry
+	entryOrder []string
+	cache      map[string][]byte
+	maxCache   int
+	mutex      sync.RWMutex
 }
 
 // NewFastaReader creates a new FASTA reader with optional indexing
 func NewFastaReader(path string) (*FastaReader, error) {
 	gzipped := isGzipped(path)
 
-	fr := &FastaReader{
+	reader := &FastaReader{
 		path:      path,
 		isGzipped: gzipped,
 		entries:   make(map[string]*FastaIndexEntry),
 		cache:     make(map[string][]byte),
-		cacheSize: 0,
-		maxCache:  10, // Keep up to 10 sequences in cache
+		maxCache:  10,
 	}
 
-	// For gzipped files, we cannot use index - load all into memory
 	if gzipped {
-		fmt.Fprintf(os.Stderr, "Loading gzipped FASTA: %s\n", path)
-		entries, err := fr.buildIndexGzipped()
+		entries, err := reader.buildIndexGzipped()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to load gzipped FASTA: %v\n", err)
-		} else {
-			fr.entries = entries
+			return nil, err
 		}
-		return fr, nil
+		reader.entries = entries
+		return reader, nil
 	}
 
-	// Try to load index file
 	indexPath := path + ".fai"
 	if _, err := os.Stat(indexPath); err == nil {
-		if err := fr.loadIndex(indexPath); err != nil {
-			// Index loading failed, continue without index
-			fr.entries = nil
+		if err := reader.loadIndex(indexPath); err != nil {
+			if rebuildErr := reader.buildAndSaveIndex(indexPath); rebuildErr != nil {
+				return nil, fmt.Errorf("invalid FASTA index (%v), and rebuilding failed: %w", err, rebuildErr)
+			}
+		}
+	} else if os.IsNotExist(err) {
+		if err := reader.buildAndSaveIndex(indexPath); err != nil {
+			return nil, err
 		}
 	} else {
-		// Index file not found, generate it
-		fmt.Fprintf(os.Stderr, "Generating FASTA index for: %s\n", path)
-		if err := fr.buildAndSaveIndex(indexPath); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to generate index: %v\n", err)
-			fr.entries = nil
-		}
+		return nil, fmt.Errorf("failed to inspect FASTA index: %w", err)
 	}
 
-	return fr, nil
+	return reader, nil
 }
 
-// buildAndSaveIndex builds index from FASTA and saves to file
-func (fr *FastaReader) buildAndSaveIndex(indexPath string) error {
+// buildAndSaveIndex builds an index and installs it atomically.
+func (fr *FastaReader) buildAndSaveIndex(indexPath string) (returnErr error) {
 	entries, err := fr.buildIndex()
 	if err != nil {
 		return err
 	}
-	fr.entries = entries
 
-	// Save index to file
-	file, err := os.Create(indexPath)
+	temporaryFile, err := os.CreateTemp(filepath.Dir(indexPath), filepath.Base(indexPath)+".tmp-*")
 	if err != nil {
-		return fmt.Errorf("failed to create index file: %w", err)
+		return fmt.Errorf("failed to create temporary FASTA index: %w", err)
 	}
-	defer file.Close()
+	temporaryPath := temporaryFile.Name()
+	temporaryFileClosed := false
+	defer func() {
+		if !temporaryFileClosed {
+			if closeErr := temporaryFile.Close(); returnErr == nil && closeErr != nil {
+				returnErr = closeErr
+			}
+		}
+		if returnErr != nil {
+			_ = os.Remove(temporaryPath)
+		}
+	}()
 
-	for _, entry := range entries {
-		fmt.Fprintf(file, "%s\t%d\t%d\t%d\t%d\n",
-			entry.Name, entry.Length, entry.Offset, entry.LineB, entry.LineL)
+	bufferedWriter := bufio.NewWriter(temporaryFile)
+	for _, name := range fr.entryOrder {
+		entry := entries[name]
+		if _, err := fmt.Fprintf(
+			bufferedWriter,
+			"%s\t%d\t%d\t%d\t%d\n",
+			entry.Name,
+			entry.Length,
+			entry.Offset,
+			entry.LineB,
+			entry.LineL,
+		); err != nil {
+			return fmt.Errorf("failed to write FASTA index: %w", err)
+		}
 	}
-
-	fmt.Fprintf(os.Stderr, "FASTA index saved to: %s\n", indexPath)
+	if err := bufferedWriter.Flush(); err != nil {
+		return fmt.Errorf("failed to flush FASTA index: %w", err)
+	}
+	if err := temporaryFile.Sync(); err != nil {
+		return fmt.Errorf("failed to sync FASTA index: %w", err)
+	}
+	if err := temporaryFile.Close(); err != nil {
+		return fmt.Errorf("failed to close FASTA index: %w", err)
+	}
+	temporaryFileClosed = true
+	if err := os.Rename(temporaryPath, indexPath); err != nil {
+		return fmt.Errorf("failed to install FASTA index: %w", err)
+	}
+	fr.entries = entries
 	return nil
 }
 
-// buildIndex builds FASTA index by scanning the file
+// buildIndex scans physical FASTA lines so offsets include their real line endings.
 func (fr *FastaReader) buildIndex() (map[string]*FastaIndexEntry, error) {
-	// For gzipped files, we cannot build index - load all into memory instead
 	if fr.isGzipped {
 		return fr.buildIndexGzipped()
 	}
@@ -180,81 +211,74 @@ func (fr *FastaReader) buildIndex() (map[string]*FastaIndexEntry, error) {
 	defer file.Close()
 
 	entries := make(map[string]*FastaIndexEntry)
+	fr.entryOrder = nil
+	bufferedReader := bufio.NewReader(file)
+	var currentEntry *FastaIndexEntry
+	var offset int64
+	var sawShortSequenceLine bool
 
-	var currentName string
-	var seqStartOffset int64
-	var lineB int64 = 0
-	var lineL int64 = 0
+	for {
+		physicalLine, readErr := bufferedReader.ReadBytes('\n')
+		if len(physicalLine) > 0 {
+			lineStart := offset
+			offset += int64(len(physicalLine))
+			sequenceLine := bytes.TrimSuffix(physicalLine, []byte{'\n'})
+			sequenceLine = bytes.TrimSuffix(sequenceLine, []byte{'\r'})
 
-	scanner := bufio.NewScanner(file)
-	offset := int64(0)
-	firstSeq := true
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		lineLen := int64(len(line))
-
-		// Detect line format
-		if firstSeq && lineLen > 0 {
-			if line[len(line)-1] == '\r' {
-				lineL = lineLen - 1 // Windows line ending
-			} else {
-				lineL = lineLen // Unix line ending
+			if len(sequenceLine) == 0 {
+				return nil, fmt.Errorf("blank lines are not supported in indexed FASTA")
 			}
-			// Check if lines have fixed length (binary FASTA)
-			if line[0] != '>' {
-				// This is sequence line, determine lineB
-				lineB = lineL
-			}
-		}
-
-		if len(line) == 0 {
-			offset += int64(lineLen) + 1 // +1 for newline
-			continue
-		}
-
-		if line[0] == '>' {
-			// Save previous sequence info
-			if !firstSeq && currentName != "" {
-				if entry, ok := entries[currentName]; ok {
-					entry.Length = offset - seqStartOffset - int64(lineB) - 1
+			if sequenceLine[0] == '>' {
+				name := parseFastaName(string(sequenceLine[1:]))
+				if name == "" {
+					return nil, fmt.Errorf("FASTA header at offset %d has no sequence name", lineStart)
 				}
+				if _, exists := entries[name]; exists {
+					return nil, fmt.Errorf("duplicate FASTA sequence name %q", name)
+				}
+				currentEntry = &FastaIndexEntry{Name: name, Offset: offset}
+				entries[name] = currentEntry
+				fr.entryOrder = append(fr.entryOrder, name)
+				sawShortSequenceLine = false
+			} else {
+				if currentEntry == nil {
+					return nil, fmt.Errorf("sequence data appears before the first FASTA header")
+				}
+				lineBases := int64(len(sequenceLine))
+				lineWidth := int64(len(physicalLine))
+				lineHasTerminator := physicalLine[len(physicalLine)-1] == '\n'
+				if lineBases == 0 {
+					return nil, fmt.Errorf("empty sequence line for %q", currentEntry.Name)
+				}
+				if currentEntry.LineB == 0 {
+					currentEntry.LineB = lineBases
+					currentEntry.LineL = lineWidth
+				} else {
+					if sawShortSequenceLine {
+						return nil, fmt.Errorf("sequence %q has data after its final short line", currentEntry.Name)
+					}
+					if lineBases > currentEntry.LineB || (lineBases == currentEntry.LineB && lineWidth != currentEntry.LineL && lineHasTerminator) {
+						return nil, fmt.Errorf("sequence %q has inconsistent line widths", currentEntry.Name)
+					}
+					if lineBases < currentEntry.LineB || !lineHasTerminator {
+						sawShortSequenceLine = true
+					}
+				}
+				currentEntry.Length += lineBases
 			}
-
-			// Parse new sequence name
-			currentName = strings.TrimSpace(line[1:])
-			if idx := strings.Index(currentName, " "); idx != -1 {
-				currentName = currentName[:idx]
-			}
-
-			// Record start of this sequence
-			seqStartOffset = offset + int64(len(line)) + 1
-			entries[currentName] = &FastaIndexEntry{
-				Name:   currentName,
-				Offset: seqStartOffset,
-				LineB:  lineB,
-				LineL:  lineL,
-			}
-			firstSeq = false
 		}
-
-		offset += int64(lineLen) + 1 // +1 for newline
+		if readErr != nil {
+			if readErr == io.EOF {
+				break
+			}
+			return nil, fmt.Errorf("failed to scan FASTA: %w", readErr)
+		}
 	}
 
-	// Save last sequence length
-	if currentName != "" {
-		if entry, ok := entries[currentName]; ok {
-			// Calculate total file size
-			fileInfo, _ := file.Stat()
-			entry.Length = fileInfo.Size() - entry.Offset - int64(entry.LineB)
-			// Adjust for number of newlines
-			if entry.Length > 0 && entry.LineB > 0 {
-				entry.Length = entry.Length - (entry.Length / int64(entry.LineB))
-			}
-		}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("FASTA contains no sequences")
 	}
-
-	return entries, scanner.Err()
+	return entries, nil
 }
 
 // buildIndexGzipped builds index for gzipped FASTA by loading into memory.
@@ -376,7 +400,7 @@ func (fr *FastaReader) loadSequenceGzipped(name string) ([]byte, bool) {
 	return nil, false
 }
 
-// loadIndex loads the FASTA index file
+// loadIndex loads and validates a FASTA index file.
 func (fr *FastaReader) loadIndex(indexPath string) error {
 	file, err := os.Open(indexPath)
 	if err != nil {
@@ -384,42 +408,73 @@ func (fr *FastaReader) loadIndex(indexPath string) error {
 	}
 	defer file.Close()
 
+	entries := make(map[string]*FastaIndexEntry)
+	entryOrder := make([]string, 0)
 	scanner := bufio.NewScanner(file)
+	lineNumber := 0
 	for scanner.Scan() {
-		line := scanner.Text()
-		fields := strings.Fields(line)
-		if len(fields) < 5 {
-			continue
+		lineNumber++
+		fields := strings.Split(scanner.Text(), "\t")
+		if len(fields) != 5 || fields[0] == "" {
+			return fmt.Errorf("invalid FASTA index line %d", lineNumber)
 		}
-
+		if _, exists := entries[fields[0]]; exists {
+			return fmt.Errorf("duplicate FASTA index entry %q", fields[0])
+		}
+		values := make([]int64, 4)
+		for valueIndex := range values {
+			parsedValue, parseErr := strconv.ParseInt(fields[valueIndex+1], 10, 64)
+			if parseErr != nil || parsedValue < 0 {
+				return fmt.Errorf("invalid FASTA index value on line %d", lineNumber)
+			}
+			values[valueIndex] = parsedValue
+		}
 		entry := &FastaIndexEntry{
 			Name:   fields[0],
-			Length: 0,
-			Offset: 0,
-			LineB:  0,
-			LineL:  0,
+			Length: values[0],
+			Offset: values[1],
+			LineB:  values[2],
+			LineL:  values[3],
 		}
-		fmt.Sscanf(fields[1], "%d", &entry.Length)
-		fmt.Sscanf(fields[2], "%d", &entry.Offset)
-		fmt.Sscanf(fields[3], "%d", &entry.LineB)
-		fmt.Sscanf(fields[4], "%d", &entry.LineL)
-
-		fr.entries[entry.Name] = entry
+		if entry.Length > 0 && (entry.LineB <= 0 || entry.LineL < entry.LineB) {
+			return fmt.Errorf("invalid FASTA line geometry for %q", entry.Name)
+		}
+		entries[entry.Name] = entry
+		entryOrder = append(entryOrder, entry.Name)
 	}
-
-	return scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("failed to read FASTA index: %w", err)
+	}
+	if len(entries) == 0 {
+		return fmt.Errorf("FASTA index is empty")
+	}
+	fr.entries = entries
+	fr.entryOrder = entryOrder
+	return nil
 }
 
-// HasIndex returns true if index is available
+func parseFastaName(headerText string) string {
+	fields := strings.Fields(headerText)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
+
+// HasIndex returns true if index is available.
 func (fr *FastaReader) HasIndex() bool {
-	return fr.entries != nil && len(fr.entries) > 0
+	fr.mutex.RLock()
+	defer fr.mutex.RUnlock()
+	return len(fr.entries) > 0
 }
 
-// GetSequence retrieves a sequence by name, using cache
+// GetSequence retrieves a sequence by name using a concurrency-safe cache.
 func (fr *FastaReader) GetSequence(name string) ([]byte, bool) {
-	// Check cache first
-	if seq, ok := fr.cache[name]; ok {
-		return seq, true
+	fr.mutex.Lock()
+	defer fr.mutex.Unlock()
+
+	if sequence, ok := fr.cache[name]; ok {
+		return sequence, true
 	}
 
 	// Try to load from file
@@ -491,27 +546,29 @@ func (fr *FastaReader) loadSequenceByIndex(name string) ([]byte, bool) {
 	}
 	defer file.Close()
 
-	// Seek to sequence position
-	_, err = file.Seek(entry.Offset, 0)
-	if err != nil {
+	if entry.Length == 0 {
+		return []byte{}, true
+	}
+	if entry.LineB <= 0 || entry.LineL < entry.LineB {
 		return nil, false
 	}
-
-	// Read sequence lines
-	var seq []byte
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if len(line) == 0 {
-			continue
+	sequence := make([]byte, 0, entry.Length)
+	remainingBases := entry.Length
+	fileOffset := entry.Offset
+	for remainingBases > 0 {
+		basesToRead := entry.LineB
+		if remainingBases < basesToRead {
+			basesToRead = remainingBases
 		}
-		if line[0] == '>' {
-			break
+		lineData := make([]byte, basesToRead)
+		if _, err := file.ReadAt(lineData, fileOffset); err != nil {
+			return nil, false
 		}
-		seq = append(seq, line...)
+		sequence = append(sequence, lineData...)
+		remainingBases -= basesToRead
+		fileOffset += entry.LineL
 	}
-
-	return seq, len(seq) > 0
+	return sequence, true
 }
 
 // loadSequenceByScan loads sequence by scanning from beginning
@@ -558,18 +615,18 @@ func (fr *FastaReader) loadSequenceByScan(name string) ([]byte, bool) {
 }
 
 // addToCache adds sequence to cache with LRU eviction
-func (fr *FastaReader) addToCache(name string, seq []byte) {
-	// Evict if cache is full
+func (fr *FastaReader) addToCache(name string, sequence []byte) {
+	if _, exists := fr.cache[name]; exists {
+		fr.cache[name] = sequence
+		return
+	}
 	if len(fr.cache) >= fr.maxCache {
-		// Simple eviction: remove first entry
-		for k := range fr.cache {
-			delete(fr.cache, k)
+		for cachedName := range fr.cache {
+			delete(fr.cache, cachedName)
 			break
 		}
 	}
-
-	fr.cache[name] = seq
-	fr.cacheSize++
+	fr.cache[name] = sequence
 }
 
 // LoadFasta loads entire FASTA into memory (backward compatibility)

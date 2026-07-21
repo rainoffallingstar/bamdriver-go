@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
 )
 
@@ -14,7 +15,10 @@ import (
 var baiMagic = [4]byte{'B', 'A', 'I', 1}
 
 // metaBin is the special BAI pseudo-bin that stores per-reference statistics.
-const metaBin = uint32(37450)
+const (
+	metaBin              = uint32(37450)
+	maximumBAICoordinate = int64(1 << 29)
+)
 
 // chunk represents a BAI index chunk (a contiguous range of virtual offsets).
 type chunk struct {
@@ -35,15 +39,32 @@ type perRefIndex struct {
 
 // alignedLen returns the number of reference bases consumed by a record's CIGAR
 // (operations M, D, N, =, X).
-func alignedLen(rec *Record) int {
-	n := 0
-	for _, op := range rec.Cigar {
-		switch op.Op {
+func alignedLen(record *Record) int64 {
+	var referenceLength int64
+	for _, operation := range record.Cigar {
+		switch operation.Op {
 		case CigarMatch, CigarDeletion, CigarSkip, CigarEqual, CigarMismatch:
-			n += op.Len
+			referenceLength += int64(operation.Len)
 		}
 	}
-	return n
+	return referenceLength
+}
+
+func baiReferenceInterval(record *Record) (int, int, error) {
+	begin := int64(record.Pos)
+	if begin < 0 || begin >= maximumBAICoordinate {
+		return 0, 0, fmt.Errorf("position %d is outside the BAI coordinate range", record.Pos)
+	}
+
+	referenceLength := alignedLen(record)
+	if referenceLength == 0 {
+		referenceLength = 1
+	}
+	end := begin + referenceLength
+	if end <= begin || end > maximumBAICoordinate {
+		return 0, 0, fmt.Errorf("alignment end %d is outside the BAI coordinate range", end)
+	}
+	return int(begin), int(end), nil
 }
 
 // reg2bin returns the smallest BAI bin that fully contains [beg, end)
@@ -118,60 +139,66 @@ func BuildIndex(bamPath string) error {
 		}
 	}
 	var nNoCoor uint64
+	var previousRecord *Record
 
 	for {
-		voffBeg := reader.VirtualOffset() // virtual offset before reading the record
-		rec, err := reader.Read()
-		if err != nil {
-			if err == io.EOF {
+		virtualOffsetBegin := reader.VirtualOffset()
+		record, readErr := reader.Read()
+		if readErr != nil {
+			if readErr == io.EOF {
 				break
 			}
-			return fmt.Errorf("failed to read BAM record while indexing: %w", err)
+			return fmt.Errorf("failed to read BAM record while indexing: %w", readErr)
 		}
-		voffEnd := reader.VirtualOffset() // virtual offset after reading the record
+		virtualOffsetEnd := reader.VirtualOffset()
 
-		if rec.RefID < 0 || int(rec.RefID) >= nRef {
+		if err := validateSortCoordinates(record, nRef); err != nil {
+			return fmt.Errorf("cannot index BAM: %w", err)
+		}
+		if previousRecord != nil && compareCoordinateRecords(previousRecord, record) > 0 {
+			return fmt.Errorf("cannot index BAM: records are not coordinate-sorted near %q", record.Name)
+		}
+		previousRecord = record
+
+		if !recordHasCoordinate(record) {
 			nNoCoor++
 			continue
 		}
 
-		ref := refs[rec.RefID]
-		ref.hasAny = true
-
-		// Track min/max voff for the meta bin.
-		if voffBeg < ref.minVoff {
-			ref.minVoff = voffBeg
+		referenceIndex := refs[record.RefID]
+		referenceIndex.hasAny = true
+		if virtualOffsetBegin < referenceIndex.minVoff {
+			referenceIndex.minVoff = virtualOffsetBegin
 		}
-		if voffEnd > ref.maxVoff {
-			ref.maxVoff = voffEnd
+		if virtualOffsetEnd > referenceIndex.maxVoff {
+			referenceIndex.maxVoff = virtualOffsetEnd
 		}
 
-		if rec.Flags&FlagUnmapped != 0 {
-			ref.nUnmapped++
-			continue // unmapped reads are not added to bin or linear index
+		if record.Flags&FlagUnmapped != 0 {
+			referenceIndex.nUnmapped++
+			continue
 		}
-		ref.nMapped++
+		referenceIndex.nMapped++
 
-		beg := int(rec.Pos)
-		alen := alignedLen(rec)
-		end := beg + alen
-		if alen == 0 {
-			end = beg + 1
+		begin, end, err := baiReferenceInterval(record)
+		if err != nil {
+			return fmt.Errorf("cannot index record %q: %w", record.Name, err)
 		}
 
-		// Bin index
-		bin := reg2bin(beg, end)
-		ref.bins[bin] = append(ref.bins[bin], chunk{voffBeg, voffEnd})
+		bin := reg2bin(begin, end)
+		referenceIndex.bins[bin] = append(
+			referenceIndex.bins[bin],
+			chunk{start: virtualOffsetBegin, end: virtualOffsetEnd},
+		)
 
-		// Linear index: one entry per 16 kb window.
-		winBeg := beg >> 14
-		winEnd := (end - 1) >> 14
-		for len(ref.linear) <= winEnd {
-			ref.linear = append(ref.linear, 0)
+		windowBegin := begin >> 14
+		windowEnd := (end - 1) >> 14
+		for len(referenceIndex.linear) <= windowEnd {
+			referenceIndex.linear = append(referenceIndex.linear, 0)
 		}
-		for w := winBeg; w <= winEnd; w++ {
-			if ref.linear[w] == 0 || voffBeg < ref.linear[w] {
-				ref.linear[w] = voffBeg
+		for windowIndex := windowBegin; windowIndex <= windowEnd; windowIndex++ {
+			if referenceIndex.linear[windowIndex] == 0 || virtualOffsetBegin < referenceIndex.linear[windowIndex] {
+				referenceIndex.linear[windowIndex] = virtualOffsetBegin
 			}
 		}
 	}
@@ -190,83 +217,126 @@ func BuildIndex(bamPath string) error {
 }
 
 // writeBAI serialises the index to disk following the BAI format (SAM spec §5.2).
-func writeBAI(path string, nRef int, refs []*perRefIndex, nNoCoor uint64) error {
-	f, err := os.Create(path)
+func writeBAI(path string, referenceCount int, references []*perRefIndex, noCoordinateCount uint64) (returnErr error) {
+	temporaryFile, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
 	if err != nil {
-		return fmt.Errorf("failed to create index file: %w", err)
+		return fmt.Errorf("failed to create temporary index file: %w", err)
 	}
-	defer f.Close()
+	temporaryPath := temporaryFile.Name()
+	temporaryFileClosed := false
+	defer func() {
+		if !temporaryFileClosed {
+			if closeErr := temporaryFile.Close(); returnErr == nil && closeErr != nil {
+				returnErr = fmt.Errorf("failed to close index file: %w", closeErr)
+			}
+		}
+		if returnErr != nil {
+			_ = os.Remove(temporaryPath)
+		}
+	}()
 
-	w := bufio.NewWriterSize(f, 1<<20) // 1 MB write buffer
-
-	// Reusable encoding buffers
-	var buf4 [4]byte
-	var buf8 [8]byte
-
-	write4 := func(v uint32) {
-		binary.LittleEndian.PutUint32(buf4[:], v)
-		w.Write(buf4[:])
+	bufferedWriter := bufio.NewWriterSize(temporaryFile, 1<<20)
+	writeUint32 := func(value uint32) error {
+		return binary.Write(bufferedWriter, binary.LittleEndian, value)
 	}
-	write8 := func(v uint64) {
-		binary.LittleEndian.PutUint64(buf8[:], v)
-		w.Write(buf8[:])
+	writeUint64 := func(value uint64) error {
+		return binary.Write(bufferedWriter, binary.LittleEndian, value)
 	}
 
-	// Magic
-	w.Write(baiMagic[:])
+	if _, err := bufferedWriter.Write(baiMagic[:]); err != nil {
+		return fmt.Errorf("failed to write BAI magic: %w", err)
+	}
+	if err := writeUint32(uint32(referenceCount)); err != nil {
+		return fmt.Errorf("failed to write BAI reference count: %w", err)
+	}
 
-	// n_ref
-	write4(uint32(nRef))
-
-	for _, ref := range refs {
-		if !ref.hasAny {
-			// No records for this reference: write empty bin and linear sections.
-			write4(0) // n_bin
-			write4(0) // n_intv
+	for _, referenceIndex := range references {
+		if !referenceIndex.hasAny {
+			if err := writeUint32(0); err != nil {
+				return err
+			}
+			if err := writeUint32(0); err != nil {
+				return err
+			}
 			continue
 		}
 
-		// n_bin = regular bins + 1 meta bin
-		write4(uint32(len(ref.bins)) + 1)
-
-		// Write each regular bin (chunks merged to reduce file size).
-		for binID, chunks := range ref.bins {
-			merged := mergeChunks(chunks)
-			write4(binID)
-			write4(uint32(len(merged)))
-			for _, c := range merged {
-				write8(uint64(c.start))
-				write8(uint64(c.end))
+		if err := writeUint32(uint32(len(referenceIndex.bins)) + 1); err != nil {
+			return err
+		}
+		binIdentifiers := make([]uint32, 0, len(referenceIndex.bins))
+		for binIdentifier := range referenceIndex.bins {
+			binIdentifiers = append(binIdentifiers, binIdentifier)
+		}
+		sort.Slice(binIdentifiers, func(leftIndex, rightIndex int) bool {
+			return binIdentifiers[leftIndex] < binIdentifiers[rightIndex]
+		})
+		for _, binIdentifier := range binIdentifiers {
+			mergedChunks := mergeChunks(referenceIndex.bins[binIdentifier])
+			if err := writeUint32(binIdentifier); err != nil {
+				return err
+			}
+			if err := writeUint32(uint32(len(mergedChunks))); err != nil {
+				return err
+			}
+			for _, indexChunk := range mergedChunks {
+				if err := writeUint64(uint64(indexChunk.start)); err != nil {
+					return err
+				}
+				if err := writeUint64(uint64(indexChunk.end)); err != nil {
+					return err
+				}
 			}
 		}
 
-		// Write meta bin 37450 with 2 pseudo-chunks.
-		write4(metaBin)
-		write4(2) // n_chunk = 2
-
-		// Pseudo-chunk 1: file range covered by this reference.
-		minVoff := ref.minVoff
-		if minVoff == math.MaxInt64 {
-			minVoff = 0
+		if err := writeUint32(metaBin); err != nil {
+			return err
 		}
-		write8(uint64(minVoff))
-		write8(uint64(ref.maxVoff))
+		if err := writeUint32(2); err != nil {
+			return err
+		}
+		minimumVirtualOffset := referenceIndex.minVoff
+		if minimumVirtualOffset == math.MaxInt64 {
+			minimumVirtualOffset = 0
+		}
+		for _, value := range []uint64{
+			uint64(minimumVirtualOffset),
+			uint64(referenceIndex.maxVoff),
+			referenceIndex.nMapped,
+			referenceIndex.nUnmapped,
+		} {
+			if err := writeUint64(value); err != nil {
+				return err
+			}
+		}
 
-		// Pseudo-chunk 2: mapped / unmapped read counts.
-		write8(ref.nMapped)
-		write8(ref.nUnmapped)
-
-		// Linear index
-		write4(uint32(len(ref.linear)))
-		for _, voff := range ref.linear {
-			write8(uint64(voff))
+		if err := writeUint32(uint32(len(referenceIndex.linear))); err != nil {
+			return err
+		}
+		for _, virtualOffset := range referenceIndex.linear {
+			if err := writeUint64(uint64(virtualOffset)); err != nil {
+				return err
+			}
 		}
 	}
 
-	// n_no_coor: reads with no coordinate
-	write8(nNoCoor)
-
-	return w.Flush()
+	if err := writeUint64(noCoordinateCount); err != nil {
+		return err
+	}
+	if err := bufferedWriter.Flush(); err != nil {
+		return fmt.Errorf("failed to flush index file: %w", err)
+	}
+	if err := temporaryFile.Sync(); err != nil {
+		return fmt.Errorf("failed to sync index file: %w", err)
+	}
+	if err := temporaryFile.Close(); err != nil {
+		return fmt.Errorf("failed to close index file: %w", err)
+	}
+	temporaryFileClosed = true
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return fmt.Errorf("failed to install index file: %w", err)
+	}
+	return nil
 }
 
 // EnsureIndex ensures that a BAI index exists for the given BAM file.
